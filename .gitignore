@@ -1,0 +1,16 @@
+# 脱獄・USBNetwork などの配布物（入手先は README）
+vendor/
+
+# 確認のために撮った画像（見本データで描いた画面と最初の画面案だけ残す）
+mock/*.png
+!mock/screen_mock.png
+!mock/sample_screen.png
+mock/kindle_copy/
+
+# 地点と Cube の URL（家に結びつくのでリポジトリに入れない）
+cube/kindash_config.json
+kindle/kindash.conf
+
+__pycache__/
+*.pyc
+out.png

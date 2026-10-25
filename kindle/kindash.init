@@ -1,0 +1,17 @@
+#!/bin/sh
+#
+# 起動時に kindash（ダッシュボード）を始める。/etc/init.d/kindash に置き、
+# /etc/rc5.d/S99kindash から呼ぶ。/mnt/us/kindash/DISABLE があれば何もしない。
+
+case "$1" in
+    start)
+        [ -f /mnt/us/kindash/DISABLE ] && exit 0
+        [ -f /mnt/us/kindash/kindash.sh ] || exit 0
+        # 標準画面と Wi-Fi が立ち上がりきるのを待ってから始める
+        ( sleep 90; sh /mnt/us/kindash/kindash.sh start ) </dev/null >/dev/null 2>&1 &
+        ;;
+    stop)
+        sh /mnt/us/kindash/kindash.sh stop >/dev/null 2>&1
+        ;;
+esac
+exit 0

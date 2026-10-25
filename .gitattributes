@@ -1,0 +1,3 @@
+# Cube と Kindle の Linux で動くので、改行もバイトもそのまま扱う
+# （CRLF に変わると kindash.sh も init も壊れる）
+* -text

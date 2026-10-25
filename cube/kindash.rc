@@ -1,0 +1,5 @@
+service kindash /usr/bin/python /data/local/kindash/kindash.py
+    class late_start
+    user root
+    group root
+    seclabel u:r:shell:s0
