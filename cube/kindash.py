@@ -46,8 +46,9 @@ METER_HUB = ("127.0.0.1", 8080)
 #    "jma_temp_station": "44132"}
 CONFIG = {"lat": 35.6812, "lon": 139.7671,
           "jma_office": "130000", "jma_area": "130010", "jma_temp_station": "44132"}
-try:
-    with io.open(os.path.join(HERE, "kindash_config.json"), "r", encoding="utf-8") as _f:
+try:  # KINDASH_CONFIG で別のファイルを指せる（PC で既定の東京駅のまま描くときは存在しないパスを渡す）
+    with io.open(os.environ.get("KINDASH_CONFIG", os.path.join(HERE, "kindash_config.json")),
+                 "r", encoding="utf-8") as _f:
         CONFIG.update(json.load(_f))
 except (IOError, OSError):
     pass
@@ -55,7 +56,7 @@ LAT, LON = float(CONFIG["lat"]), float(CONFIG["lon"])
 JMA_OFFICE, JMA_AREA, JMA_TEMP_STATION = CONFIG["jma_office"], CONFIG["jma_area"], CONFIG["jma_temp_station"]
 JMA = "https://www.jma.go.jp/bosai"
 OPEN_METEO = ("https://api.open-meteo.com/v1/forecast?latitude=%s&longitude=%s"
-              "&hourly=temperature_2m,precipitation_probability,precipitation,weather_code"
+              "&hourly=temperature_2m,precipitation,weather_code"
               "&timezone=Asia%%2FTokyo&timeformat=unixtime&past_days=1&forecast_days=2"
               "&models=jma_seamless,best_match") % (LAT, LON)
 
@@ -66,8 +67,8 @@ RENDER_EVERY = 15 * 60
 AVG_WINDOW = 5 * 60  # 「いまの電力」は直近5分の平均
 STALE_AFTER = 10 * 60
 
-# 段の高さ（合計 800）。mock/render_mock.py と同じ
-H_HEAD, H_BANNER, H_NOW, H_HOURLY, H_PRECIP, H_WEEK = 34, 34, 124, 134, 132, 148
+# 段の高さ（合計 800）。1時間予報は12時間ずつ2段で、残りが電力
+H_HEAD, H_BANNER, H_NOW, H_HOURLY, H_PRECIP, H_WEEK = 34, 34, 118, 216, 124, 138
 H_POWER = H - (H_HEAD + H_BANNER + H_NOW + H_HOURLY + H_PRECIP + H_WEEK)
 
 # tools/build_assets.py がこの2つを読んで素材を作る
@@ -254,7 +255,9 @@ def fetch_observed_rain(station, latest):
 
 
 def fetch_open_meteo():
-    """1時間ごとの予報。気象庁のモデルを優先し、欠けた時間だけ best_match で埋める。"""
+    """1時間ごとの予報。気象庁のモデルを優先し、欠けた時間だけ best_match で埋める。
+    降水確率は取らない（気象庁のモデルは出さず、best_match の値は ECMWF のもので
+    天気や降水量と食い違う）。確率は気象庁の府県予報の6時間ごとの値を使う。"""
     h = get_json(OPEN_METEO, "openmeteo.json")["hourly"]
 
     def pick(field, i):
@@ -263,15 +266,14 @@ def fetch_open_meteo():
 
     pts = []
     for i, t in enumerate(h["time"]):
-        pop = pick("precipitation_probability", i)
         pts.append({"time": t, "temp": pick("temperature_2m", i), "mm": pick("precipitation", i),
-                    "pop": None if pop is None else int(round(pop / 10.0) * 10),
                     "code": pick("weather_code", i)})
     return pts
 
 
-def fetch_weekly(now):
-    """明日から6日分。明日・明後日は府県予報（data[0]）で、週間予報（data[1]）の空欄を埋める。"""
+def fetch_forecast(now):
+    """気象庁の府県予報と週間予報。週間予報（明日から6日分）と、6時間ごとの降水確率を返す。
+    明日・明後日は府県予報（data[0]）で、週間予報（data[1]）の空欄を埋める。"""
     data = get_json(JMA + "/forecast/data/forecast/%s.json" % JMA_OFFICE, "forecast_%s.json" % JMA_OFFICE)
     short, weekly = data[0], data[1]
 
@@ -304,9 +306,11 @@ def fetch_weekly(now):
     s1 = short["timeSeries"][1]
     pa = area(s1, JMA_AREA)
     pops = {}
+    blocks = []  # [始まりの unix 時間, 降水確率%]。6時間ずつ
     for i, iso in enumerate(s1["timeDefines"]):
         if pa["pops"][i] != "":
             pops.setdefault(day_of(iso), []).append(int(pa["pops"][i]))
+            blocks.append([parse_iso_jst(iso), int(pa["pops"][i])])
     s2 = short["timeSeries"][2]
     ta = area(s2, JMA_TEMP_STATION)
     for i, iso in enumerate(s2["timeDefines"]):
@@ -330,7 +334,7 @@ def fetch_weekly(now):
         d = days.get(key, {})
         out.append({"mday": t.tm_mday, "wday": t.tm_wday, "code": d.get("code", ""),
                     "pop": d.get("pop", ""), "min": d.get("min", ""), "max": d.get("max", "")})
-    return out
+    return {"weekly": out, "pops": blocks}
 
 
 def fetch_power(now):
@@ -379,7 +383,10 @@ def collect(now):
         attempt("amedas", lambda: fetch_amedas(station, latest))
         attempt("observed", lambda: fetch_observed_rain(station, latest))
     attempt("hourly", fetch_open_meteo)
-    attempt("weekly", lambda: fetch_weekly(now))
+    attempt("forecast", lambda: fetch_forecast(now))
+    fc = out.pop("forecast", None)
+    out["weekly"] = fc["weekly"] if fc else None
+    out["pops"] = fc["pops"] if fc else None
     attempt("power", lambda: fetch_power(now))
     return out
 
@@ -563,14 +570,23 @@ def jma_icon(code):
     return {1: "sun", 2: "cloud", 3: "rain", 4: "snow"}.get(c // 100, "cloud")
 
 
-def rain_event(hourly, now, lookahead=3 * 3600, horizon=12 * 3600, min_mm=0.5, min_pop=60):
-    """3時間以内に始まる雨（0.5mm/h 以上か降水確率60%以上）の、ひと続きの時間帯。
-    画面の予報と同じ12時間先までで区切り、そこまで続くなら long=True。"""
+def pop_at(blocks, t):
+    """t を含む6時間の降水確率（気象庁の府県予報）。無ければ None。"""
+    for start, pop in blocks or []:
+        if start <= t < start + 6 * 3600:
+            return pop
+    return None
+
+
+def rain_event(hourly, now, lookahead=3 * 3600, horizon=12 * 3600, min_mm=0.5):
+    """3時間以内に始まる雨（気象庁モデルで 0.5mm/h 以上）の、ひと続きの時間帯。
+    確率は6時間ごとで粗すぎて「何時から」が言えないので、判定は1時間ごとの降水量だけで行う。
+    12時間先までで区切り、そこまで続くなら long=True。"""
     pts = [p for p in hourly if now < p["time"] <= now + horizon]
     start = None
     ev = []
     for p in pts:
-        wet = (p["mm"] or 0) >= min_mm or (p["pop"] or 0) >= min_pop
+        wet = (p["mm"] or 0) >= min_mm
         bucket = p["time"] - 3600
         if start is None:
             if wet and bucket <= now + lookahead:
@@ -585,7 +601,7 @@ def rain_event(hourly, now, lookahead=3 * 3600, horizon=12 * 3600, min_mm=0.5, m
     if not ev:
         return None
     return {"start": start, "end": ev[-1]["time"], "long": ev[-1] is pts[-1],
-            "mm": max(p["mm"] or 0 for p in ev), "pop": max(p["pop"] or 0 for p in ev)}
+            "mm": max(p["mm"] or 0 for p in ev)}
 
 
 def is_night(ts):
@@ -619,8 +635,10 @@ def render(data, assets):
         if ev["start"] <= now:
             msg = "☂ いま雨　%s　最大 %s mm/h" % (until, fmt_num(ev["mm"]))
         else:
-            msg = "☂ %d時ごろから雨　最大 %s mm/h（降水確率 %d%%）" % (
-                jst_tm(ev["start"]).tm_hour, fmt_num(ev["mm"]), ev["pop"])
+            pop = pop_at(data.get("pops"), ev["start"])
+            msg = "☂ %d時ごろから雨　最大 %s mm/h%s" % (
+                jst_tm(ev["start"]).tm_hour, fmt_num(ev["mm"]),
+                "" if pop is None else "（降水確率 %d%%）" % pop)
         c.text(12, y + H_BANNER / 2.0, msg, "b17", PAPER, anchor="lm")
     else:
         msg = "3時間以内に雨の予報はありません" if data.get("hourly") else "降水の予報を取得できません"
@@ -633,47 +651,76 @@ def render(data, assets):
     am = data.get("amedas")
     if am:
         obs = jst_tm(am["time"])
-        c.text(12, top + 8, "いま（%sアメダス %d:%02d観測）" % (am["station"], obs.tm_hour, obs.tm_min), "r14", DARK)
+        c.text(12, top + 6, "いま（%sアメダス %d:%02d観測）" % (am["station"], obs.tm_hour, obs.tm_min), "r14", DARK)
         s = fmt_num(am["temp"])
-        wpx = c.text(12, top + 28, s, "b64")
-        c.text(12 + wpx + 6, top + 54, "℃", "r24")
+        wpx = c.text(12, top + 24, s, "b64")
+        c.text(12 + wpx + 6, top + 50, "℃", "r24")
         wind = WIND_DIRS[am["wind_dir"]] if am["wind_dir"] is not None and 0 <= am["wind_dir"] <= 16 else "--"
-        c.text(12, top + 100, "湿度 %s%%　%s %sm/s　1h %smm" % (
+        c.text(12, top + 95, "湿度 %s%%　%s %sm/s　1h %smm" % (
             fmt_num(am["humidity"], 0), wind, fmt_num(am["wind"]), fmt_num(am["precip1h"])), "r15", DARK)
     else:
-        c.text(12, top + 8, "いま（アメダス）", "r14", DARK)
-        c.text(12, top + 50, "取得できません", "b18", DARK)
+        c.text(12, top + 6, "いま（アメダス）", "r14", DARK)
+        c.text(12, top + 48, "取得できません", "b18", DARK)
     c.vline(W // 2, top, top + H_NOW)
     pw = data.get("power")
-    c.text(W // 2 + 12, top + 8, "電力（直近5分の平均）" if pw and pw["n"] else "いまの電力", "r14", DARK)
+    c.text(W // 2 + 12, top + 6, "電力（直近5分の平均）" if pw and pw["n"] else "いまの電力", "r14", DARK)
     if pw and pw["w"] is not None:
         old = pw["ts"] is None or now - pw["ts"] > 300
         s = "%d" % round(pw["w"])
-        wpx = c.text(W // 2 + 12, top + 28, s, "b64", MID if old else BLACK)
-        c.text(W // 2 + 12 + wpx + 6, top + 54, "W", "r24")
+        wpx = c.text(W // 2 + 12, top + 24, s, "b64", MID if old else BLACK)
+        c.text(W // 2 + 12 + wpx + 6, top + 50, "W", "r24")
         kw = pw["w"] / 1000.0
         level = "かなり多め" if kw >= 3 else ("多め" if kw >= 1.2 else "ふつう")
-        c.text(W // 2 + 12, top + 100, ("古い値" if old else level) + "（1.2kW 以上で「多め」）", "r15", DARK)
+        c.text(W // 2 + 12, top + 95, ("古い値" if old else level) + "（1.2kW 以上で「多め」）", "r15", DARK)
     else:
-        c.text(W // 2 + 12, top + 50, "取得できません", "b18", DARK)
+        c.text(W // 2 + 12, top + 48, "取得できません", "b18", DARK)
     y += H_NOW
     c.hline(y)
 
-    # --- 12時間予報 ---
+    # --- 1時間予報（24時間を12時間ずつ2段）。降水確率は気象庁の6時間ごとの値を、
+    #     その6時間の欄にまたがる横線の上に1つだけ出す ---
     hourly = data.get("hourly")
+    pops = data.get("pops")
     if hourly:
-        ahead = [p for p in hourly if p["time"] >= now][:12]
+        ahead = [p for p in hourly if p["time"] >= now][:24]
         cw = W / 12.0
-        for i, p in enumerate(ahead):
-            cx = cw * i + cw / 2.0
-            c.text(cx, y + 8, "%d時" % jst_tm(p["time"]).tm_hour, "r14", DARK, anchor="mt")
-            ic = wmo_icon(p["code"])
-            if ic in ("sun", "partly") and is_night(p["time"] - 1800):
-                ic = {"sun": "moon", "partly": "mooncloud"}[ic]
-            if ic:
-                c.icon(ic, cx, y + 50, 19)
-            c.text(cx, y + 78, "%s°" % fmt_num(p["temp"], 0), "b19", anchor="mt")
-            c.text(cx, y + 106, "--" if p["pop"] is None else "%d%%" % p["pop"], "r14", DARK, anchor="mt")
+        row_h = H_HOURLY / 2.0
+        for row in range(2):
+            ry = y + row * row_h
+            if row:
+                c.hline(int(ry), LIGHT, 12, W - 12)
+            cells = ahead[row * 12:(row + 1) * 12]
+            for i, p in enumerate(cells):
+                cx = cw * i + cw / 2.0
+                h = jst_tm(p["time"]).tm_hour
+                c.text(cx, ry + 5, "%d時" % h, "b17" if h == 0 else "r13", BLACK if h == 0 else DARK, anchor="mt")
+                ic = wmo_icon(p["code"])
+                if ic in ("sun", "partly") and is_night(p["time"] - 1800):
+                    ic = {"sun": "moon", "partly": "mooncloud"}[ic]
+                if ic:
+                    c.icon(ic, cx, ry + 42, 19)
+                c.text(cx, ry + 64, "%s°" % fmt_num(p["temp"], 0), "b18", anchor="mt")
+            # 6時間のまとまりごとに、欄の範囲へ横線と確率
+            spans = []
+            for i, p in enumerate(cells):
+                pop = pop_at(pops, p["time"] - 1800)
+                key = None if pop is None else (pop, (p["time"] - 1800 + JST) // (6 * 3600))
+                if spans and spans[-1][0] == key:
+                    spans[-1][2] = i
+                else:
+                    spans.append([key, i, i])
+            ly = ry + 96
+            for key, i0, i1 in spans:
+                x0, x1 = cw * i0 + 4, cw * (i1 + 1) - 4
+                label = "--" if key is None else "%d%%" % key[0]
+                tw = c.measure(label, "r14") + 10
+                mid = (x0 + x1) / 2.0
+                if x1 - x0 > tw + 8:
+                    c.hline(int(ly), MID, int(x0), int(mid - tw / 2))
+                    c.hline(int(ly), MID, int(mid + tw / 2), int(x1))
+                    c.vline(int(x0), int(ly - 4), int(ly + 1), MID)
+                    c.vline(int(x1), int(ly - 4), int(ly + 1), MID)
+                c.text(mid, ly, label, "r14", DARK, anchor="mm")
     else:
         c.text(W / 2.0, y + H_HOURLY / 2.0, "1時間予報を取得できません", "b18", DARK, anchor="mm")
     y += H_HOURLY
@@ -724,12 +771,12 @@ def render(data, assets):
             cx = cw * i + cw / 2.0
             if i:
                 c.vline(int(cw * i), y + 6, y + H_WEEK - 6, LIGHT)
-            c.text(cx, y + 8, "%s %d" % (WEEKDAYS[d["wday"]], d["mday"]), "r15", DARK, anchor="mt")
+            c.text(cx, y + 6, "%s %d" % (WEEKDAYS[d["wday"]], d["mday"]), "r15", DARK, anchor="mt")
             ic = jma_icon(d["code"])
             if ic:
-                c.icon(ic, cx, y + 54, 25)
-            c.text(cx, y + 88, "%s° / %s°" % (d["max"] or "--", d["min"] or "--"), "b18", anchor="mt")
-            c.text(cx, y + 116, "%s%%" % d["pop"] if d["pop"] else "--", "r14", DARK, anchor="mt")
+                c.icon(ic, cx, y + 50, 25)
+            c.text(cx, y + 82, "%s° / %s°" % (d["max"] or "--", d["min"] or "--"), "b18", anchor="mt")
+            c.text(cx, y + 107, "%s%%" % d["pop"] if d["pop"] else "--", "r14", DARK, anchor="mt")
     else:
         c.text(W / 2.0, y + H_WEEK / 2.0, "週間予報を取得できません", "b18", DARK, anchor="mm")
     y += H_WEEK
