@@ -14,3 +14,4 @@ kindle/kindash.conf
 __pycache__/
 *.pyc
 out.png
+kindle/voice/

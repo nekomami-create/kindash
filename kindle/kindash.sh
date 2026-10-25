@@ -5,6 +5,7 @@
 #   kindash.sh start    ダッシュボードにする（Kindle の標準画面を止める）
 #   kindash.sh stop     普段の Kindle に戻す
 #   kindash.sh status   動いているか
+#   kindash.sh say      ごみの日の声を今すぐ試す（今日の分。収集日でなければ鳴らない）
 #
 # 動いている間のキー操作: HOME で普段の Kindle に戻る、それ以外のキーで今すぐ更新。
 # Kindle 3 の busybox は 1.7 と古いので、grep -E や date -d は使わない。
@@ -15,10 +16,17 @@ FULL_EVERY=4            # 4回に1回（1時間ごと）は全面を点滅させ
 KEY_HOME=102
 
 DIR=/mnt/us/kindash
-# Cube の URL は kindash.conf に書く（リポジトリには入れない）:
+# Cube の URL などは kindash.conf に書く（リポジトリには入れない）:
 #   URL="http://<CubeのIP>:8090/screen.png"
+#   ANNOUNCE="07:30"     ごみの日を声で知らせる時刻（空なら知らせない）
+#   VOLUME=100           そのときのスピーカーの音量（0〜127）
 URL=""
+ANNOUNCE=""
+VOLUME=100
 [ -f $DIR/kindash.conf ] && . $DIR/kindash.conf
+GARBAGE_URL="${URL%/screen.png}/garbage"
+VOICE=$DIR/voice
+ANNOUNCED=$DIR/.announced
 LOG=$DIR/kindash.log
 PIDFILE=/var/run/kindash.pid
 SLEEPFILE=/var/run/kindash.sleep
@@ -51,24 +59,69 @@ ensure_wifi() {
     return 1
 }
 
-fetch() {
-    rm -f $IMG.new
-    wget -q -O $IMG.new "$URL" &
+get() {
+    # get URL ファイル。busybox 1.7 の wget にはタイムアウトの指定がないので、自分で見張る
+    rm -f "$2"
+    wget -q -O "$2" "$1" &
     wpid=$!
     n=0
-    # busybox 1.7 の wget にはタイムアウトの指定がないので、自分で見張る
     while kill -0 $wpid 2>/dev/null; do
         sleep 1
         n=$(( n + 1 ))
         if [ $n -ge 60 ]; then
             kill $wpid 2>/dev/null
-            log "fetch timed out"
+            log "fetch timed out: $1"
             return 1
         fi
     done
-    wait $wpid || return 1
+    wait $wpid
+}
+
+fetch() {
+    get "$URL" $IMG.new || return 1
     [ -s $IMG.new ] || return 1
     mv $IMG.new $IMG
+}
+
+# --- ごみの日の声 ---
+jst_day() {
+    echo $(( ( $(date +%s) + 32400 ) / 86400 ))
+}
+
+announce_sec() {
+    # "07:30" -> その日の 0時からの秒数（busybox 1.7 は 08 を8進数と読むので先頭の0を落とす）
+    h=$(echo ${ANNOUNCE%%:*} | sed 's/^0\([0-9]\)/\1/')
+    m=$(echo ${ANNOUNCE##*:} | sed 's/^0\([0-9]\)/\1/')
+    echo $(( h * 3600 + m * 60 ))
+}
+
+announce() {
+    [ "$(cat $ANNOUNCED 2>/dev/null)" = "$(jst_day)" ] && return 0
+    ensure_wifi || return 1
+    get "$GARBAGE_URL" /tmp/kindash.garbage || { log "garbage fetch failed"; return 1; }
+    jst_day > $ANNOUNCED
+    [ -s /tmp/kindash.garbage ] || { log "no garbage today"; return 0; }
+    # 標準画面を止めているので音量は自分で上げ、鳴らし終えたら戻す
+    old=$(amixer sget Speaker | sed -n 's/.*Front Left: Playback \([0-9]*\).*/\1/p')
+    amixer -q sset Speaker $VOLUME,$VOLUME
+    aplay -q $VOICE/chime.wav 2>/dev/null
+    for v in $(cat /tmp/kindash.garbage); do
+        if [ -f $VOICE/$v.wav ]; then
+            aplay -q $VOICE/$v.wav 2>/dev/null
+        else
+            log "no voice for $v"
+        fi
+    done
+    amixer -q sset Speaker ${old:-0},${old:-0}
+    log "announced $(cat /tmp/kindash.garbage | tr '\n' ' ')"
+}
+
+announce_if_due() {
+    # 時刻ちょうどに鳴らせなかったとき（再起動中など）のために、15分以内なら更新のついでに鳴らす
+    [ -n "$ANNOUNCE" ] || return 0
+    s=$(( ( $(date +%s) + 32400 ) % 86400 ))
+    a=$(announce_sec)
+    [ $s -ge $a ] && [ $s -lt $(( a + INTERVAL )) ] && announce
 }
 
 show_error() {
@@ -92,13 +145,26 @@ update() {
 }
 
 sleep_until_next() {
+    # 次の更新か、ごみの日を知らせる時刻の早い方まで寝る。どちらで起きたかを WAKE に入れる
     now=$(date +%s)
     next=$(( now - now % INTERVAL + INTERVAL + OFFSET ))
     [ $(( next - now )) -gt $INTERVAL ] && next=$(( next - INTERVAL ))
+    WAKE=update
+    if [ -n "$ANNOUNCE" ]; then
+        s=$(( ( now + 32400 ) % 86400 ))
+        ann=$(( now - s + $(announce_sec) ))
+        [ $ann -le $now ] && ann=$(( ann + 86400 ))
+        if [ $ann -lt $next ]; then
+            next=$ann
+            WAKE=announce
+        fi
+    fi
     sleep $(( next - now )) &
     echo $! > $SLEEPFILE
     wait $!
     rm -f $SLEEPFILE
+    # キーで早く起こされたら更新する
+    [ $(date +%s) -lt $(( next - 5 )) ] && WAKE=update
 }
 
 watch_keys() {
@@ -128,9 +194,16 @@ run() {
     count=0
     watch_keys &
     echo $! > $PIDFILE.keys
+    update
+    announce_if_due
     while true; do
-        update
         sleep_until_next
+        if [ "$WAKE" = announce ]; then
+            announce
+        else
+            update
+            announce_if_due
+        fi
     done
 }
 
@@ -173,6 +246,10 @@ case "$1" in
         stop
         echo "stopped"
         ;;
+    say)
+        rm -f $ANNOUNCED
+        announce
+        ;;
     status)
         if [ -f $PIDFILE ] && kill -0 $(cat $PIDFILE) 2>/dev/null; then
             echo "running (pid $(cat $PIDFILE))"
@@ -182,7 +259,7 @@ case "$1" in
         fi
         ;;
     *)
-        echo "usage: $0 start|stop|status"
+        echo "usage: $0 start|stop|status|say"
         exit 1
         ;;
 esac

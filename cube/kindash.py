@@ -8,6 +8,7 @@ Cube の Python 2.7 は標準ライブラリだけで、ssl も zlib も画像�
 
   GET /screen.png   いちばん新しい画面（古ければ描き直してから返す）
   GET /render       今すぐ描き直す
+  GET /garbage      今日のごみの日（Kindle が鳴らす音声の名前を1行ずつ）
   GET /healthz      "ok"
 
 PC では KINDASH_SAMPLES=<フォルダ> を付けると、ネットワークの代わりに
@@ -52,6 +53,13 @@ try:  # KINDASH_CONFIG で別のファイルを指せる（PC で既定の東京
         CONFIG.update(json.load(_f))
 except (IOError, OSError):
     pass
+# ごみの日も同じファイルに書く（無ければ出さない）。曜日は「月」、第n曜日は「第3金」:
+#   "garbage": [["可燃ごみ", ["火", "金"], "burnable"], ["不燃ごみ", ["第1水", "第3水"], "nonburnable"]],
+#   "garbage_skip": ["2026-12-31"]
+# 3つ目は Kindle が鳴らす音声ファイルの名前（kindle/voice/<名前>.wav）
+GARBAGE = CONFIG.get("garbage", [])
+GARBAGE_SKIP = set(CONFIG.get("garbage_skip", []))
+GARBAGE_HOURS = (4, 12)  # 見出しに帯を出す時間（収集日の朝）
 LAT, LON = float(CONFIG["lat"]), float(CONFIG["lon"])
 JMA_OFFICE, JMA_AREA, JMA_TEMP_STATION = CONFIG["jma_office"], CONFIG["jma_area"], CONFIG["jma_temp_station"]
 JMA = "https://www.jma.go.jp/bosai"
@@ -84,7 +92,10 @@ WIND_DIRS = ["静穏", "北北東", "北東", "東北東", "東", "東南東", "
              "南南西", "南西", "西南西", "西", "西北西", "北西", "北北西", "北"]
 # 画面に出す文言の残り（build_assets.py が字を拾えるようにここに並べておく）
 MESSAGES = ["データなし", "取得できません", "3時間以内に雨の予報はありません", "古い値",
-            "いま雨", "ごろまで", "ごろから雨", "最大", "降水確率", "観測"]
+            "いま雨", "ごろまで", "ごろから雨", "最大", "降水確率", "観測",
+            # ごみの日の帯。分別の名前は設定から来るので、よく使う字をここに並べておく
+            "今日は", "の日", "朝8時まで", "可燃ごみ", "不燃ごみ", "資源", "粗大ごみ", "プラスチック",
+            "ペットボトル", "びん・缶", "古紙", "容器包装", "燃やすごみ", "燃やさないごみ", "危険物"]
 # アメダスの観測所名の字は、build_assets.py が全観測所ぶん r14 に入れる
 
 
@@ -604,6 +615,16 @@ def rain_event(hourly, now, lookahead=3 * 3600, horizon=12 * 3600, min_mm=0.5):
             "mm": max(p["mm"] or 0 for p in ev)}
 
 
+def garbage_today(now):
+    """今日（日本時間）出せるごみ。設定の順に [名前, 曜日の並び, 音声の名前] を返す。"""
+    tm = jst_tm(now)
+    if time.strftime("%Y-%m-%d", tm) in GARBAGE_SKIP:
+        return []
+    wd = WEEKDAYS[tm.tm_wday]
+    nth = "第%d%s" % ((tm.tm_mday - 1) // 7 + 1, wd)
+    return [g for g in GARBAGE if wd in g[1] or nth in g[1]]
+
+
 def is_night(ts):
     h = jst_tm(ts).tm_hour
     return h >= 18 or h < 6
@@ -620,8 +641,14 @@ def render(data, assets):
     now = data["now"]
     tm = jst_tm(now)
 
-    # --- 見出し ---
+    # --- 見出し。収集日の朝は、左の空いているところにごみの日の帯 ---
     y = 0
+    garbage = garbage_today(now) if GARBAGE_HOURS[0] <= tm.tm_hour < GARBAGE_HOURS[1] else []
+    if garbage:
+        msg = "今日は %s の日（朝8時まで）" % "・".join(g[0] for g in garbage)
+        wpx = c.measure(msg, "b17")
+        c.rect(6, 4, 6 + wpx + 16, H_HEAD - 4, BLACK)
+        c.text(14, H_HEAD / 2.0, msg, "b17", PAPER, anchor="lm")
     c.text(W - 12, H_HEAD / 2.0, "%d/%d(%s) %02d:%02d 更新" % (
         tm.tm_mon, tm.tm_mday, WEEKDAYS[tm.tm_wday], tm.tm_hour, tm.tm_min), "r15", DARK, anchor="rm")
     y += H_HEAD
@@ -857,6 +884,10 @@ class Server(object):
         path = parts[1].decode("latin-1") if len(parts) > 1 else "/"
         if path == "/healthz":
             self.reply(conn, 200, b"text/plain", b"ok")
+        elif path == "/garbage":
+            # Kindle が朝に鳴らす音声の名前を1行ずつ。今日が収集日でなければ空
+            body = "".join("%s\n" % g[2] for g in garbage_today(time.time()) if len(g) > 2)
+            self.reply(conn, 200, b"text/plain", body.encode("utf-8"))
         elif path in ("/screen.png", "/render"):
             if path == "/render" or self.png is None or time.time() - self.rendered_at > STALE_AFTER:
                 self.safe_render()

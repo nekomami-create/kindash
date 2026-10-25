@@ -17,7 +17,8 @@ meter_hub (127.0.0.1:8080) -------->│  600x800・8bit グレーの PNG     eip
 
 ## 画面の中身（上から）
 
-1. 更新時刻
+1. 更新時刻。収集日の朝（4時〜正午）は、左に「今日は 可燃ごみ の日（朝8時まで）」の帯。
+   決まった時刻（例 7:30）に Kindle がチャイムと声でも知らせる
 2. 雨の帯：3時間以内に雨（気象庁モデルで 0.5mm/h 以上）が始まるときだけ白黒反転。
    先12時間までで区切る。なければ「3時間以内に雨の予報はありません」
 3. いま：左に最寄りアメダスの気温・湿度・風・1時間降水量、右に電力の直近5分の平均
@@ -42,6 +43,7 @@ meter_hub (127.0.0.1:8080) -------->│  600x800・8bit グレーの PNG     eip
 | `kindle/kindash.sh` | Kindle 側。`start` / `stop` / `status` |
 | `kindle/kindash.init` | Kindle の起動時に `kindash.sh start` を呼ぶ（`/etc/init.d/kindash`） |
 | `tools/build_assets.py` | PC の Pillow で素材を作る |
+| `tools/make_voices.ps1` | ごみの日の声とチャイムを Windows の日本語音声で作る |
 | `samples/` | 見本データ。天気は東京駅で取った実データ、電力（`cube_*.json`）は作り物 |
 | `mock/render_mock.py` / `screen_mock.png` | 最初の画面案 |
 
@@ -58,12 +60,42 @@ meter_hub (127.0.0.1:8080) -------->│  600x800・8bit グレーの PNG     eip
 - `lat` / `lon`: 地点。アメダスは、気温を測っている観測所のうち一番近い所を自動で選ぶ
 - `jma_office` / `jma_area`: 気象庁の府県予報区と一次細分区（週間予報の天気と降水確率）
 - `jma_temp_station`: 週間予報の気温を出す地点
+- `garbage`（任意）: ごみの日。`[名前, 曜日の並び, 音声の名前]` の並び。曜日は `月`、第n曜日は `第3金`
+- `garbage_skip`（任意）: 年末年始など、決まりどおりに収集しない日（`"2026-12-31"`）
+
+```json
+"garbage": [["可燃ごみ", ["火", "金"], "burnable"],
+            ["不燃ごみ", ["第1水", "第3水"], "nonburnable"],
+            ["資源", ["木"], "resource"]],
+"garbage_skip": []
+```
+
+分別の名前の字は `kindash.py` の `MESSAGES` にあるものしか描けない（よく使う名前は並べてある）。
+別の名前を使うなら、そこに足して素材を作り直す。
 
 `kindle/kindash.conf`（Kindle の `/mnt/us/kindash/` に置く。無ければ `start` しない）:
 
 ```sh
 URL="http://<CubeのIP>:8090/screen.png"
+ANNOUNCE="07:30"     # ごみの日を声で知らせる時刻（空なら知らせない）
+VOLUME=100           # そのときのスピーカーの音量（0〜127）
 ```
+
+### ごみの日の声
+
+Kindle 3 の読み上げは英語しか話せないので、決まった文を Windows の日本語音声（Haruka）で
+前もって WAV にしておき、`aplay` で鳴らす。`tools/make_voices.ps1` が `kindash_config.json` の
+`garbage` を読んで、`kindle/voice/<音声の名前>.wav`（「今日は、可燃ごみの日です。朝8時までに出しましょう。」）と
+`chime.wav` を作る。Microsoft の音声で作ったものなので、リポジトリには入れていない。
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\make_voices.ps1
+```
+
+できた WAV は Kindle の `/mnt/us/kindash/voice/` に置く。Kindle は `ANNOUNCE` の時刻ちょうどに起きて
+Cube の `/garbage` に今日の分を聞き、チャイムのあとに鳴らす（1日1回。その時刻に再起動中などで
+鳴らせなかったら、15分以内の更新のついでに鳴らす）。`sh /mnt/us/kindash/kindash.sh say` で今すぐ試せる
+（収集日でなければ鳴らない）。
 
 ## Cube 側
 
@@ -81,6 +113,7 @@ Cube の Python 2.7 には ssl も zlib も画像ライブラリもないので:
 ```
 GET /screen.png   いちばん新しい画面（10分より古ければ描き直してから返す）
 GET /render       今すぐ描き直す
+GET /garbage      今日のごみの日（音声の名前を1行ずつ。収集日でなければ空）
 GET /healthz      "ok"
 ```
 
@@ -158,6 +191,9 @@ Kindle 3 の busybox は 1.7 で、`nohup`・`grep -E`・`date -d` が無い。�
 unix 時間は正しいので、時刻の計算は `date +%s` から日本時間を出している。
 
 ## 未確認
+
+- ごみの日の声が、リビングで聞こえる大きさで鳴るか（音量0での再生は確認済み。最初の本番は 2026-10-26 7:30）
+- 祝日の扱い。自治体のカレンダーでは祝日も収集日として並んでいるが、文面では確かめていない
 
 - 停電などで電池が空になったあと、給電が戻ったときに自動で起動するか（`reboot` での再起動は確認済み）
 - 電池は学習容量が新品の約74%。常時給電で使う前提。劣化したら互換電池（GP-S10-346392-0100）に交換する
