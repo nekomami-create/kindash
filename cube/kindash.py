@@ -677,8 +677,8 @@ def render(data, assets):
     y += H_NOW
     c.hline(y)
 
-    # --- 1時間予報（24時間を12時間ずつ2段）。降水確率は気象庁の6時間ごとの値を、
-    #     その6時間の欄にまたがる横線の上に1つだけ出す ---
+    # --- 1時間予報（24時間を12時間ずつ2段）。6時間の区切り（0・6・12・18時の後ろ）に縦線を引き、
+    #     区切りの時刻を太字にする。降水確率は気象庁の6時間ごとの値を、まとまりの中央に1つだけ出す ---
     hourly = data.get("hourly")
     pops = data.get("pops")
     if hourly:
@@ -693,14 +693,17 @@ def render(data, assets):
             for i, p in enumerate(cells):
                 cx = cw * i + cw / 2.0
                 h = jst_tm(p["time"]).tm_hour
-                c.text(cx, ry + 5, "%d時" % h, "b17" if h == 0 else "r13", BLACK if h == 0 else DARK, anchor="mt")
+                edge = h % 6 == 0
+                c.text(cx, ry + 5, "%d時" % h, "b17" if edge else "r13", BLACK if edge else DARK, anchor="mt")
+                if edge and i < len(cells) - 1:
+                    c.vline(int(cw * (i + 1)), int(ry + 3), int(ry + row_h - 3), MID)
                 ic = wmo_icon(p["code"])
                 if ic in ("sun", "partly") and is_night(p["time"] - 1800):
                     ic = {"sun": "moon", "partly": "mooncloud"}[ic]
                 if ic:
                     c.icon(ic, cx, ry + 42, 19)
                 c.text(cx, ry + 64, "%s°" % fmt_num(p["temp"], 0), "b18", anchor="mt")
-            # 6時間のまとまりごとに、欄の範囲へ横線と確率
+            # 6時間のまとまりごとに、その中央へ確率
             spans = []
             for i, p in enumerate(cells):
                 pop = pop_at(pops, p["time"] - 1800)
@@ -709,18 +712,12 @@ def render(data, assets):
                     spans[-1][2] = i
                 else:
                     spans.append([key, i, i])
-            ly = ry + 96
+            ly = ry + 95
             for key, i0, i1 in spans:
-                x0, x1 = cw * i0 + 4, cw * (i1 + 1) - 4
-                label = "--" if key is None else "%d%%" % key[0]
-                tw = c.measure(label, "r14") + 10
-                mid = (x0 + x1) / 2.0
-                if x1 - x0 > tw + 8:
-                    c.hline(int(ly), MID, int(x0), int(mid - tw / 2))
-                    c.hline(int(ly), MID, int(mid + tw / 2), int(x1))
-                    c.vline(int(x0), int(ly - 4), int(ly + 1), MID)
-                    c.vline(int(x1), int(ly - 4), int(ly + 1), MID)
-                c.text(mid, ly, label, "r14", DARK, anchor="mm")
+                label = "--" if key is None else "降水 %d%%" % key[0]
+                if i1 - i0 < 2:  # 狭いまとまりは数字だけ
+                    label = "--" if key is None else "%d%%" % key[0]
+                c.text(cw * (i0 + i1 + 1) / 2.0, ly, label, "r15", DARK, anchor="mm")
     else:
         c.text(W / 2.0, y + H_HOURLY / 2.0, "1時間予報を取得できません", "b18", DARK, anchor="mm")
     y += H_HOURLY
