@@ -18,7 +18,7 @@ KEY_HOME=102
 DIR=/mnt/us/kindash
 # Cube の URL などは kindash.conf に書く（リポジトリには入れない）:
 #   URL="http://<CubeのIP>:8090/screen.png"
-#   ANNOUNCE="07:30"     ごみの日を声で知らせる時刻（空なら知らせない）
+#   ANNOUNCE="07:00 07:30"  ごみの日を声で知らせる時刻。空白で区切って何回でも（空なら知らせない）
 #   VOLUME=100           そのときのスピーカーの音量（0〜127）
 URL=""
 ANNOUNCE=""
@@ -90,17 +90,20 @@ jst_day() {
 
 announce_sec() {
     # "07:30" -> その日の 0時からの秒数（busybox 1.7 は 08 を8進数と読むので先頭の0を落とす）
-    h=$(echo ${ANNOUNCE%%:*} | sed 's/^0\([0-9]\)/\1/')
-    m=$(echo ${ANNOUNCE##*:} | sed 's/^0\([0-9]\)/\1/')
+    h=$(echo ${1%%:*} | sed 's/^0\([0-9]\)/\1/')
+    m=$(echo ${1##*:} | sed 's/^0\([0-9]\)/\1/')
     echo $(( h * 3600 + m * 60 ))
 }
 
 announce() {
-    [ "$(cat $ANNOUNCED 2>/dev/null)" = "$(jst_day)" ] && return 0
+    # announce 時刻。同じ日の同じ時刻には1回だけ鳴らす。.announced には「日 時刻」を今日の分だけ残す
+    key="$(jst_day) $1"
+    grep -q "^$key\$" $ANNOUNCED 2>/dev/null && return 0
     ensure_wifi || return 1
     get "$GARBAGE_URL" /tmp/kindash.garbage || { log "garbage fetch failed"; return 1; }
-    jst_day > $ANNOUNCED
-    [ -s /tmp/kindash.garbage ] || { log "no garbage today"; return 0; }
+    { grep "^$(jst_day) " $ANNOUNCED 2>/dev/null; echo "$key"; } > $ANNOUNCED.new
+    mv $ANNOUNCED.new $ANNOUNCED
+    [ -s /tmp/kindash.garbage ] || { log "no garbage today ($1)"; return 0; }
     # 標準画面を止めているので音量は自分で上げ、鳴らし終えたら戻す
     old=$(amixer sget Speaker | sed -n 's/.*Front Left: Playback \([0-9]*\).*/\1/p')
     amixer -q sset Speaker $VOLUME,$VOLUME
@@ -113,15 +116,16 @@ announce() {
         fi
     done
     amixer -q sset Speaker ${old:-0},${old:-0}
-    log "announced $(cat /tmp/kindash.garbage | tr '\n' ' ')"
+    log "announced ($1) $(cat /tmp/kindash.garbage | tr '\n' ' ')"
 }
 
 announce_if_due() {
     # 時刻ちょうどに鳴らせなかったとき（再起動中など）のために、15分以内なら更新のついでに鳴らす
-    [ -n "$ANNOUNCE" ] || return 0
     s=$(( ( $(date +%s) + 32400 ) % 86400 ))
-    a=$(announce_sec)
-    [ $s -ge $a ] && [ $s -lt $(( a + INTERVAL )) ] && announce
+    for t in $ANNOUNCE; do
+        a=$(announce_sec $t)
+        [ $s -ge $a ] && [ $s -lt $(( a + INTERVAL )) ] && announce $t
+    done
 }
 
 show_error() {
@@ -150,15 +154,16 @@ sleep_until_next() {
     next=$(( now - now % INTERVAL + INTERVAL + OFFSET ))
     [ $(( next - now )) -gt $INTERVAL ] && next=$(( next - INTERVAL ))
     WAKE=update
-    if [ -n "$ANNOUNCE" ]; then
-        s=$(( ( now + 32400 ) % 86400 ))
-        ann=$(( now - s + $(announce_sec) ))
+    s=$(( ( now + 32400 ) % 86400 ))
+    for t in $ANNOUNCE; do
+        ann=$(( now - s + $(announce_sec $t) ))
         [ $ann -le $now ] && ann=$(( ann + 86400 ))
         if [ $ann -lt $next ]; then
             next=$ann
             WAKE=announce
+            WAKE_AT=$t
         fi
-    fi
+    done
     sleep $(( next - now )) &
     echo $! > $SLEEPFILE
     wait $!
@@ -199,7 +204,7 @@ run() {
     while true; do
         sleep_until_next
         if [ "$WAKE" = announce ]; then
-            announce
+            announce $WAKE_AT
         else
             update
             announce_if_due
@@ -247,8 +252,9 @@ case "$1" in
         echo "stopped"
         ;;
     say)
-        rm -f $ANNOUNCED
-        announce
+        # 「今」という名前の時刻として鳴らす（毎回鳴るよう、その印は消しておく）
+        grep -v " now\$" $ANNOUNCED > $ANNOUNCED.new 2>/dev/null; mv $ANNOUNCED.new $ANNOUNCED
+        announce now
         ;;
     status)
         if [ -f $PIDFILE ] && kill -0 $(cat $PIDFILE) 2>/dev/null; then
